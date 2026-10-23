@@ -58,34 +58,62 @@ fn is_tracking_glue(items: &[ParagraphItem<ParagraphElement>], index: usize) -> 
     index > 0 && matches!(items[index - 1], ParagraphItem::Penalty { penalty: INFINITE_PENALTY, flagged: true, .. })
 }
 
-// How far a character hangs into the margin, in thousandths of its advance (microtype's defaults, via justif).
+// Hanging punctuation, CSS `hanging-punctuation: first` model (justif's "first-line-and-line-ends"):
+// these marks sit entirely outside the measure at every line end, and opening marks do so at the
+// start of a paragraph only. Elsewhere they set flush.
+const HANGING_END: &str = "'\"‘’“”‚„‹›«».,";
+const HANGING_START: &str = "'\"‘’“”‚„‹›«»";
+
+// Partial protrusion for the other marks, in thousandths of their advance (microtype's defaults, via justif).
 fn protrusion(c: char, left: bool) -> i32 {
     match (c, left) {
-        ('.', false) => 700,
-        (',' | ':' | '-' | '‐', false) => 500,
+        (':' | '-' | '‐', false) => 500,
         (';', false) => 300,
         ('!' | '?', false) => 100,
         ('–', _) => 200,
         ('—', _) => 150,
-        ('‘' | '“' | '"' | '\'', true) => 300,
-        ('’' | '\'', false) => 400,
-        ('”' | '"', false) => 300,
         ('(', true) => 100,
         (')', false) => 200,
         _ => 0,
     }
 }
 
+// Width of the run of `set` characters at one end of a text plan, in pixels.
+fn hanging_run(text: &str, plan: &crate::font::RenderPlan, set: &str, at_end: bool) -> i32 {
+    let count = if at_end {
+        text.chars().rev().take_while(|c| set.contains(*c)).count()
+    } else {
+        text.chars().take_while(|c| set.contains(*c)).count()
+    };
+    // Assumes one glyph per mark, which holds for punctuation; bail out on anything shorter.
+    if count == 0 || count >= plan.len() {
+        return 0;
+    }
+    let glyphs = if at_end { plan.len() - count..plan.len() } else { 0..count };
+    glyphs.map(|i| plan.glyph_advance(i)).sum()
+}
+
 // Right-margin hang of the text box ending the item list, in pixels.
 fn right_hang(items: &[ParagraphItem<ParagraphElement>]) -> i32 {
     match items.last() {
         Some(ParagraphItem::Box { data: ParagraphElement::Text(element), .. }) if element.plan.len() > 0 => {
+            let full = hanging_run(&element.text, &element.plan, HANGING_END, true);
+            if full > 0 {
+                return full;
+            }
             element.text.chars().next_back().map_or(0, |c| {
                 protrusion(c, false) * element.plan.glyph_advance(element.plan.len() - 1) / 1000
             })
         },
         _ => 0,
     }
+}
+
+// Pushes items that pull the next box `hang` pixels left when a line starts with it, and cancel out otherwise.
+fn push_left_hang(items: &mut Vec<ParagraphItem<ParagraphElement>>, hang: i32) {
+    items.push(ParagraphItem::Box { width: 0, data: ParagraphElement::Nothing });
+    items.push(ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: false });
+    items.push(ParagraphItem::Glue { width: -hang, stretch: 0, shrink: 0 });
 }
 
 pub type Page = Vec<DrawCommand>;
@@ -880,16 +908,25 @@ impl Engine {
                                     };
                                     plan.space_out(style.letter_spacing);
 
+                                    let is_paragraph_start = !items.iter().any(|itm| matches!(itm,
+                                        ParagraphItem::Box { data: ParagraphElement::Text(_) | ParagraphElement::Image(_), .. }));
+
+                                    if is_paragraph_start && parent_style.text_align != TextAlign::Center {
+                                        // Opening quotes hang fully at the start of a paragraph.
+                                        let hang = hanging_run(buf, &plan, HANGING_START, false);
+                                        if hang > 0 {
+                                            push_left_hang(&mut items, hang);
+                                        }
+                                    }
+
                                     if parent_style.text_align == TextAlign::Justify && matches!(items.last(), Some(ParagraphItem::Glue { .. })) {
-                                        // Hang an opening mark into the left margin when a line starts here.
+                                        // Other opening marks protrude slightly when a later line starts here.
                                         let hang = buf.chars().next().map_or(0, |c| protrusion(c, true) * plan.glyph_advance(0) / 1000);
                                         if hang > 0 {
                                             if let Some(ParagraphItem::Glue { width, .. }) = items.last_mut() {
                                                 *width += hang;
                                             }
-                                            items.push(ParagraphItem::Box { width: 0, data: ParagraphElement::Nothing });
-                                            items.push(ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: false });
-                                            items.push(ParagraphItem::Glue { width: -hang, stretch: 0, shrink: 0 });
+                                            push_left_hang(&mut items, hang);
                                         }
                                         // Letter spacing may absorb part of the line's slack.
                                         let track = plan.width * TRACKING_PER_MILLE / 1000;
@@ -1008,9 +1045,10 @@ impl Engine {
                                             if style.font_kind == FontKind::Monospace || is_unbreakable {
                                                 items.push(ParagraphItem::Glue { width, stretch: 0, shrink: 0 });
                                             } else {
+                                                let hang = right_hang(&items);
                                                 let stretch = 3 * width;
                                                 items.push(ParagraphItem::Glue { width: 0, stretch, shrink: 0 });
-                                                items.push(ParagraphItem::Penalty { width: 0, penalty: 0, flagged: false });
+                                                items.push(ParagraphItem::Penalty { width: -hang, penalty: 0, flagged: false });
                                                 items.push(ParagraphItem::Glue { width, stretch: -stretch, shrink: 0 });
                                             }
                                         },
@@ -1502,7 +1540,7 @@ impl Engine {
                             exact_width.ceil() as i32
                         };
                         // <td>&nbsp;=&nbsp;</td>
-                        if stretch == 0 && shrink == 0 {
+                        if stretch == 0 && shrink == 0 && approx_width > 0 {
                             let rect = rect![*position + pt!(0, -ascender),
                                              *position + pt!(approx_width, -descender)];
                             if let Some(pr) = page_rect.as_mut() {
