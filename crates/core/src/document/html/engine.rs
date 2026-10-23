@@ -49,7 +49,7 @@ const DEMERITS: Demerits = Demerits {
 const LOOSE_TOLERANCES: [f32; 3] = [2.0, 4.0, 8.6];
 
 // Each word's letter spacing may stretch or shrink by this share of its width (justif uses 3%).
-const TRACKING_PER_MILLE: i32 = 25;
+const TRACKING_PER_MILLE: i32 = 20;
 
 // Precedes the glue that holds a word's letter-spacing stretch. No other item is a flagged infinite penalty.
 const TRACKING_MARKER: ParagraphItem<ParagraphElement> = ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: true };
@@ -1335,6 +1335,17 @@ impl Engine {
             }
         }
 
+        // eTeX's \lastlinefit at full strength (justif's `lastLineFit: 1`): the paragraph's last line
+        // sets its word spaces at the mean ratio of the lines above it.
+        let fit_ratio = if style.text_align == TextAlign::Justify && bps.len() > 1 {
+            let body = &bps[..bps.len() - 1];
+            let ratios: Vec<f32> = body.iter().map(|bp| bp.ratio).filter(|r| r.is_finite()).collect();
+            (!ratios.is_empty()).then(|| ratios.iter().sum::<f32>() / ratios.len() as f32)
+        } else {
+            None
+        };
+        let lines_count = bps.len();
+
         for (j, bp) in bps.into_iter().enumerate() {
             let drift = if glue_drifts.is_empty() {
                 0.0
@@ -1360,6 +1371,26 @@ impl Engine {
             while last_index < index && !items[last_index].is_box()  {
                 last_index += 1;
             }
+
+            // Only the paragraph's real ending, and only when it isn't already pressed past the measure.
+            let mut last_line_fit = None;
+            if let Some(mean) = fit_ratio {
+                if j + 1 == lines_count && index == items.len() - 1 && ratio >= 0.0 {
+                    let (stretch, shrink) = items[last_index..index].iter().enumerate()
+                        .filter_map(|(k, itm)| match itm {
+                            ParagraphItem::Glue { stretch, shrink, .. } if *stretch <= line_width && !is_tracking_glue(&items, last_index + k) => Some((*stretch, *shrink)),
+                            _ => None,
+                        })
+                        .fold((0, 0), |(a, b), (s, k)| (a + s, b + k));
+                    let room = (end_x - start_x - current_text_indent - width) as f32;
+                    // Never let the stretched ending run past the margin.
+                    let r = if mean > 0.0 && stretch > 0 { mean.min(room / stretch as f32) } else { mean };
+                    if (r > 0.0 && stretch > 0) || (r < 0.0 && shrink > 0) {
+                        last_line_fit = Some(r.max(-1.0));
+                    }
+                }
+            }
+
 
             let start_command_index = page.len();
 
@@ -1524,9 +1555,19 @@ impl Engine {
                         last_x_position = position.x;
                     },
                     ParagraphItem::Glue { width, stretch, shrink } if ratio.is_finite() => {
-                        let amplitude = if ratio.is_sign_positive() { stretch } else { shrink };
-                        let mut exact_width = width as f32 + ratio * amplitude as f32 + drift;
                         let is_track = is_tracking_glue(&items, i);
+                        let mut exact_width = if let Some(r) = last_line_fit {
+                            // Word spaces take the paragraph's mean; letters and the fill keep their natural width.
+                            if is_track || stretch > line_width {
+                                width as f32 + drift
+                            } else {
+                                width as f32 + r * (if r > 0.0 { stretch } else { shrink }) as f32 + drift
+                            }
+                        } else {
+                            let amplitude = if ratio.is_sign_positive() { stretch } else { shrink };
+                            width as f32 + ratio * amplitude as f32 + drift
+                        };
+                        let amplitude = if ratio.is_sign_positive() { stretch } else { shrink };
                         if is_track {
                             // Letters never go past their limit, even on lines looser than the tolerance.
                             let capped = exact_width.clamp(-(amplitude as f32), amplitude as f32);
