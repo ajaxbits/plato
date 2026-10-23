@@ -1328,16 +1328,18 @@ impl Font {
             let info = hb_buffer_get_glyph_infos(buf, ptr::null_mut());
             let pos = hb_buffer_get_glyph_positions(buf, ptr::null_mut());
             let mut glyphs = Vec::with_capacity(len);
+            let mut pen = 0;
 
             for i in 0..len {
                 let pos_i = &*pos.add(i);
                 let info_i = &*info.add(i);
-                render_plan.width += pos_i.x_advance >> 6;
+                let advance = rounded_advance(&mut pen, pos_i.x_advance);
+                render_plan.width += advance;
                 glyphs.push(GlyphPlan {
                     codepoint: info_i.codepoint,
                     cluster: start_index + info_i.cluster as usize,
-                    advance: pt!(pos_i.x_advance >> 6, pos_i.y_advance >> 6),
-                    offset: pt!(pos_i.x_offset >> 6, -pos_i.y_offset >> 6),
+                    advance: pt!(advance, pos_i.y_advance >> 6),
+                    offset: pt!(round_26_6(pos_i.x_offset), -pos_i.y_offset >> 6),
                 });
                 render_plan.scripts.insert(start+i, script);
             }
@@ -1380,11 +1382,13 @@ impl Font {
             let info = hb_buffer_get_glyph_infos(buf, ptr::null_mut());
             let pos = hb_buffer_get_glyph_positions(buf, ptr::null_mut());
             let mut render_plan = RenderPlan::default();
+            let mut pen = 0;
             let mut missing_glyphs = Vec::new();
 
             for i in 0..len {
                 let pos_i = &*pos.add(i);
                 let info_i = &*info.add(i);
+                let advance = rounded_advance(&mut pen, pos_i.x_advance);
                 if info_i.codepoint == 0 {
                     if let Some((start, end)) = missing_glyphs.pop() {
                         if i == end {
@@ -1397,13 +1401,13 @@ impl Font {
                         missing_glyphs.push((i, i+1));
                     }
                 } else {
-                    render_plan.width += pos_i.x_advance >> 6;
+                    render_plan.width += advance;
                 }
                 let glyph = GlyphPlan {
                     codepoint: info_i.codepoint,
                     cluster: info_i.cluster as usize,
-                    advance: pt!(pos_i.x_advance >> 6, pos_i.y_advance >> 6),
-                    offset: pt!(pos_i.x_offset >> 6, -pos_i.y_offset >> 6),
+                    advance: pt!(advance, pos_i.y_advance >> 6),
+                    offset: pt!(round_26_6(pos_i.x_offset), -pos_i.y_offset >> 6),
                 };
                 render_plan.glyphs.push(glyph);
             }
@@ -1643,6 +1647,19 @@ struct GlyphPlan {
     cluster: usize,
     offset: Point,
     advance: Point,
+}
+
+// Rounds a 26.6 fixed-point value to whole pixels.
+fn round_26_6(value: i32) -> i32 {
+    (value + 32) >> 6
+}
+
+// Advance in whole pixels that keeps the rounded pen position within half a pixel of the exact one.
+// Truncating each advance instead tightens every letter pair by half a pixel on average, unevenly.
+fn rounded_advance(pen: &mut i32, advance: i32) -> i32 {
+    let start = round_26_6(*pen);
+    *pen += advance;
+    round_26_6(*pen) - start
 }
 
 #[derive(Debug, Clone)]
