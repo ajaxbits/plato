@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::convert::TryFrom;
 use anyhow::Error;
 use kl_hyphenate::{Standard, Hyphenator, Iter};
-use paragraph_breaker::{Item as ParagraphItem, Breakpoint, INFINITE_PENALTY};
+use paragraph_breaker::{Item as ParagraphItem, Breakpoint, Demerits, INFINITE_PENALTY};
 use paragraph_breaker::{total_fit, standard_fit};
 use xi_unicode::LineBreakIterator;
 use percent_encoding::percent_decode_str;
@@ -35,6 +35,58 @@ use super::xml::XmlExt;
 const DEFAULT_DPI: u16 = 300;
 const DEFAULT_WIDTH: u32 = 1404;
 const DEFAULT_HEIGHT: u32 = 1872;
+
+// TeX's defaults, except for consecutive hyphens: TeX's 10,000 stacks noticeably more of them,
+// since only word spaces stretch here.
+const DEMERITS: Demerits = Demerits {
+    line: 10,
+    flagged: 30_000,
+    fitness: 10_000,
+    final_flagged: 5_000,
+};
+
+// Thresholds tried, in order, after the hyphenated pass and before the greedy fallback.
+const LOOSE_TOLERANCES: [f32; 3] = [2.0, 4.0, 8.6];
+
+// Each word's letter spacing may stretch or shrink by this share of its width (as in justif).
+const TRACKING_PER_MILLE: i32 = 30;
+
+// Precedes the glue that holds a word's letter-spacing stretch. No other item is a flagged infinite penalty.
+const TRACKING_MARKER: ParagraphItem<ParagraphElement> = ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: true };
+
+fn is_tracking_glue(items: &[ParagraphItem<ParagraphElement>], index: usize) -> bool {
+    index > 0 && matches!(items[index - 1], ParagraphItem::Penalty { penalty: INFINITE_PENALTY, flagged: true, .. })
+}
+
+// How far a character hangs into the margin, in thousandths of its advance (microtype's defaults, via justif).
+fn protrusion(c: char, left: bool) -> i32 {
+    match (c, left) {
+        ('.', false) => 700,
+        (',' | ':' | '-' | '‐', false) => 500,
+        (';', false) => 300,
+        ('!' | '?', false) => 100,
+        ('–', _) => 200,
+        ('—', _) => 150,
+        ('‘' | '“' | '"' | '\'', true) => 300,
+        ('’' | '\'', false) => 400,
+        ('”' | '"', false) => 300,
+        ('(', true) => 100,
+        (')', false) => 200,
+        _ => 0,
+    }
+}
+
+// Right-margin hang of the text box ending the item list, in pixels.
+fn right_hang(items: &[ParagraphItem<ParagraphElement>]) -> i32 {
+    match items.last() {
+        Some(ParagraphItem::Box { data: ParagraphElement::Text(element), .. }) if element.plan.len() > 0 => {
+            element.text.chars().next_back().map_or(0, |c| {
+                protrusion(c, false) * element.plan.glyph_advance(element.plan.len() - 1) / 1000
+            })
+        },
+        _ => 0,
+    }
+}
 
 pub type Page = Vec<DrawCommand>;
 
@@ -746,6 +798,8 @@ impl Engine {
             font.set_size(font_size, self.dpi);
             font.plan(" ", None, None).width
         };
+        // Stands in for TeX's infinite \parfillskip: last lines stretch their spaces by at most 5%.
+        let fill_stretch = 10 * line_width;
 
         if parent_style.text_align == TextAlign::Center {
             items.push(ParagraphItem::Box { width: 0, data: ParagraphElement::Nothing });
@@ -826,6 +880,25 @@ impl Engine {
                                     };
                                     plan.space_out(style.letter_spacing);
 
+                                    if parent_style.text_align == TextAlign::Justify && matches!(items.last(), Some(ParagraphItem::Glue { .. })) {
+                                        // Hang an opening mark into the left margin when a line starts here.
+                                        let hang = buf.chars().next().map_or(0, |c| protrusion(c, true) * plan.glyph_advance(0) / 1000);
+                                        if hang > 0 {
+                                            if let Some(ParagraphItem::Glue { width, .. }) = items.last_mut() {
+                                                *width += hang;
+                                            }
+                                            items.push(ParagraphItem::Box { width: 0, data: ParagraphElement::Nothing });
+                                            items.push(ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: false });
+                                            items.push(ParagraphItem::Glue { width: -hang, stretch: 0, shrink: 0 });
+                                        }
+                                        // Letter spacing may absorb part of the line's slack.
+                                        let track = plan.width * TRACKING_PER_MILLE / 1000;
+                                        if track > 0 && style.font_kind != FontKind::Monospace {
+                                            items.push(TRACKING_MARKER);
+                                            items.push(ParagraphItem::Glue { width: 0, stretch: track, shrink: track });
+                                        }
+                                    }
+
                                     items.push(ParagraphItem::Box {
                                         width: plan.width,
                                         data: ParagraphElement::Text(TextElement {
@@ -847,7 +920,7 @@ impl Engine {
                                 }
                                 if c.is_whitespace() {
                                     if c == '\n' && parent_style.retain_whitespace {
-                                        let stretch = if parent_style.text_align == TextAlign::Center { big_stretch } else { line_width };
+                                        let stretch = if parent_style.text_align == TextAlign::Center { big_stretch } else { fill_stretch };
 
                                         items.push(ParagraphItem::Penalty { penalty: INFINITE_PENALTY, width: 0, flagged: false });
                                         items.push(ParagraphItem::Glue { width: 0, stretch, shrink: 0 });
@@ -912,6 +985,10 @@ impl Engine {
 
                                     match parent_style.text_align {
                                         TextAlign::Justify => {
+                                            let hang = right_hang(&items);
+                                            if hang > 0 && !is_unbreakable {
+                                                items.push(ParagraphItem::Penalty { width: -hang, penalty: 0, flagged: false });
+                                            }
                                             items.push(ParagraphItem::Glue { width, stretch: width/2, shrink: width/3 });
                                         },
                                         TextAlign::Center => {
@@ -941,7 +1018,9 @@ impl Engine {
                                 } else if end_index < text.len() {
                                     let penalty = if c == '-' { self.hyphen_penalty } else { 0 };
                                     let flagged = penalty > 0;
-                                    if matches!(parent_style.text_align, TextAlign::Justify | TextAlign::Center) {
+                                    if parent_style.text_align == TextAlign::Justify {
+                                        items.push(ParagraphItem::Penalty { width: -right_hang(&items), penalty, flagged });
+                                    } else if parent_style.text_align == TextAlign::Center {
                                         items.push(ParagraphItem::Penalty { width: 0, penalty, flagged });
                                     } else {
                                         let stretch = 3 * space_plan.glyph_advance(0);
@@ -957,7 +1036,7 @@ impl Engine {
                     }
                 },
                 InlineMaterial::LineBreak => {
-                    let stretch = if parent_style.text_align == TextAlign::Center { big_stretch } else { line_width };
+                    let stretch = if parent_style.text_align == TextAlign::Center { big_stretch } else { fill_stretch };
 
                     items.push(ParagraphItem::Penalty { penalty: INFINITE_PENALTY, width: 0, flagged: false });
                     items.push(ParagraphItem::Glue { width: 0, stretch, shrink: 0 });
@@ -985,10 +1064,10 @@ impl Engine {
         if !items.is_empty() && items.last().map(ParagraphItem::penalty) != Some(-INFINITE_PENALTY) {
             items.push(ParagraphItem::Penalty { penalty: INFINITE_PENALTY,  width: 0, flagged: false });
 
-            let stretch = if parent_style.text_align == TextAlign::Center { big_stretch } else { line_width };
+            let stretch = if parent_style.text_align == TextAlign::Center { big_stretch } else { fill_stretch };
             items.push(ParagraphItem::Glue { width: 0, stretch, shrink: 0 });
 
-            items.push(ParagraphItem::Penalty { penalty: -INFINITE_PENALTY, width: 0, flagged: true });
+            items.push(ParagraphItem::Penalty { penalty: -INFINITE_PENALTY, width: 0, flagged: false });
         }
 
         (items, floats)
@@ -1119,7 +1198,8 @@ impl Engine {
         let mut line_lengths: Vec<i32> = para_shape.iter().map(|(a, b)| b - a).collect();
         line_lengths[0] -= text_indent;
 
-        let mut bps = total_fit(&items, &line_lengths, self.stretch_tolerance, 0);
+        let mut tolerance = self.stretch_tolerance.min(1.0);
+        let mut bps = total_fit(&items, &line_lengths, tolerance, 0, &DEMERITS);
 
         let mut hyph_indices = Vec::new();
         let mut glue_drifts = Vec::new();
@@ -1128,7 +1208,18 @@ impl Engine {
             if let Some(dictionary) = hyph_lang(style.language.as_ref().map_or(DEFAULT_HYPH_LANG, String::as_str))
                                                .and_then(|lang| HYPHENATION_PATTERNS.get(&lang)) {
                 items = self.hyphenate_paragraph(style, dictionary, items, &mut hyph_indices);
-                bps = total_fit(&items, &line_lengths, self.stretch_tolerance, 0);
+                tolerance = self.stretch_tolerance;
+                bps = total_fit(&items, &line_lengths, tolerance, 0, &DEMERITS);
+            }
+        }
+
+        for threshold in std::iter::once(self.stretch_tolerance).chain(LOOSE_TOLERANCES) {
+            if !bps.is_empty() {
+                break;
+            }
+            if threshold > tolerance {
+                tolerance = threshold;
+                bps = total_fit(&items, &line_lengths, tolerance, 0, &DEMERITS);
             }
         }
 
@@ -1232,13 +1323,22 @@ impl Engine {
 
             let start_command_index = page.len();
 
+            // Letter spacing waiting for the next text box, and slack it couldn't take (spaces absorb it).
+            let mut pending_track = 0;
+            let mut track_excess = 0.0;
+
             for i in last_index..index {
                 match items[i] {
-                    ParagraphItem::Box { ref data, width } => {
+                    ParagraphItem::Box { ref data, mut width } => {
                         match data {
                             ParagraphElement::Text(element) => {
+                                let mut plan = element.plan.clone();
+                                if pending_track != 0 && plan.spread(pending_track) {
+                                    width += pending_track;
+                                    pending_track = 0;
+                                }
                                 let pt = pt!(position.x, position.y - element.vertical_align);
-                                let rect = rect![pt + pt!(0, -ascender), pt + pt!(element.plan.width, -descender)];
+                                let rect = rect![pt + pt!(0, -ascender), pt + pt!(plan.width, -descender)];
                                 if let Some(pr) = page_rect.as_mut() {
                                     pr.absorb(&rect);
                                 } else {
@@ -1257,7 +1357,7 @@ impl Engine {
                                     position: pt,
                                     rect,
                                     text: element.text.clone(),
-                                    plan: element.plan.clone(),
+                                    plan,
                                     uri: element.uri.clone(),
                                     font_kind: element.font_kind,
                                     font_style: element.font_style,
@@ -1385,7 +1485,17 @@ impl Engine {
                     },
                     ParagraphItem::Glue { width, stretch, shrink } if ratio.is_finite() => {
                         let amplitude = if ratio.is_sign_positive() { stretch } else { shrink };
-                        let exact_width = width as f32 + ratio * amplitude as f32 + drift;
+                        let mut exact_width = width as f32 + ratio * amplitude as f32 + drift;
+                        let is_track = is_tracking_glue(&items, i);
+                        if is_track {
+                            // Letters never go past their limit, even on lines looser than the tolerance.
+                            let capped = exact_width.clamp(-(amplitude as f32), amplitude as f32);
+                            track_excess += exact_width - capped;
+                            exact_width = capped;
+                        } else if stretch != 0 || shrink != 0 {
+                            exact_width += track_excess;
+                            track_excess = 0.0;
+                        }
                         let approx_width = if epsilon.is_sign_positive() {
                             exact_width.floor() as i32
                         } else {
@@ -1402,7 +1512,11 @@ impl Engine {
                             }
                         }
                         epsilon += approx_width as f32 - exact_width;
-                        position.x += approx_width;
+                        if is_track {
+                            pending_track += approx_width;
+                        } else {
+                            position.x += approx_width;
+                        }
                     },
                     _ => (),
                 }
@@ -1528,7 +1642,8 @@ impl Engine {
                             index += segment.len();
                             if index < chunk.len() {
                                 if style.text_align == TextAlign::Justify {
-                                    hyph_items.push(ParagraphItem::Penalty { width: hyphen_width, penalty: self.hyphen_penalty, flagged: true });
+                                    // The hyphen hangs halfway into the margin.
+                                    hyph_items.push(ParagraphItem::Penalty { width: hyphen_width - hyphen_width * protrusion('-', false) / 1000, penalty: self.hyphen_penalty, flagged: true });
                                 } else {
                                     hyph_items.push(ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: false });
                                     hyph_items.push(ParagraphItem::Glue { width: 0, stretch, shrink: 0 });

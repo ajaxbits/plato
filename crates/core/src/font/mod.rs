@@ -1694,6 +1694,25 @@ impl RenderPlan {
         }
     }
 
+    // Spreads `extra` pixels as evenly as possible over the gaps between glyphs.
+    // Returns false, leaving the plan untouched, when there is no gap.
+    pub fn spread(&mut self, extra: i32) -> bool {
+        let gaps = self.glyphs.len().saturating_sub(1) as i32;
+        if gaps == 0 {
+            return false;
+        }
+        for (i, glyph) in self.glyphs[..gaps as usize].iter_mut().enumerate() {
+            let i = i as i32;
+            glyph.advance.x += extra * (i + 1) / gaps - extra * i / gaps;
+        }
+        self.width += extra;
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.glyphs.len()
+    }
+
     pub fn split_off(&mut self, index: usize, width: i32) -> RenderPlan {
         let mut next_scripts = FxHashMap::default();
         if !self.scripts.is_empty() {

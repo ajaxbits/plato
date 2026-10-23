@@ -1055,9 +1055,7 @@ checksum = "9f50d9b3dabb09ecd771ad0aa242ca6894994c130308ca3d7684634df8037391"
 
 [[package]]
 name = "paragraph-breaker"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3365bc53d974e212e903f93bb377be189c8f9ae3409fbbb60e5f284dfd73d3"
+version = "0.5.0"
 
 [[package]]
 name = "pbkdf2"

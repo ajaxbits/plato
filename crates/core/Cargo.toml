@@ -22,7 +22,7 @@ toml = "0.9.11"
 zip = "7.0.0"
 kl-hyphenate = "0.7.3"
 entities = "1.0.1"
-paragraph-breaker = "0.4.4"
+paragraph-breaker = { path = "../paragraph-breaker" }
 xi-unicode = "0.3.0"
 septem = "1.1.0"
 byteorder = "1.5.0"

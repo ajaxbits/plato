@@ -139,7 +139,10 @@ dithered-kinds = ["cbz", "jpg", "png", "jpeg"]
 [reader.paragraph-breaker]
 # The penalty for hyphenated lines. The maximum value is 10_000.
 hyphen-penalty = 50
-# The stretch/shrink tolerance of inter-word spaces.
+# The stretch/shrink tolerance of inter-word spaces once hyphenation is allowed.
+# Paragraphs are first set without hyphens at a tolerance of at most 1.0.
+# If neither pass fits, looser tolerances (2.0, 4.0, 8.6) are tried before
+# filling lines one at a time.
 stretch-tolerance = 1.26
 
 # Refresh the screen every `regular` page turns when the colors aren't inverted,
