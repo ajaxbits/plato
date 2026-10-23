@@ -49,7 +49,7 @@ const DEMERITS: Demerits = Demerits {
 const LOOSE_TOLERANCES: [f32; 3] = [2.0, 4.0, 8.6];
 
 // Each word's letter spacing may stretch or shrink by this share of its width (justif uses 3%).
-const TRACKING_PER_MILLE: i32 = 20;
+const TRACKING_PER_MILLE: i32 = 25;
 
 // Precedes the glue that holds a word's letter-spacing stretch. No other item is a flagged infinite penalty.
 const TRACKING_MARKER: ParagraphItem<ParagraphElement> = ParagraphItem::Penalty { width: 0, penalty: INFINITE_PENALTY, flagged: true };
